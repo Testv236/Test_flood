@@ -1,0 +1,332 @@
+from datetime import datetime
+import json
+import paho.mqtt.client as mqtt
+from pymongo import MongoClient
+
+# ==========================================
+# 1. CẤU HÌNH BẢO MẬT & KẾT NỐI
+# ==========================================
+HIVEMQ_HOST = "your-cluster-id.s1.eu.hivemq.cloud"
+HIVEMQ_PORT = 8883
+HIVEMQ_USER = "your_hivemq_user"
+HIVEMQ_PASSWORD = "your_hivemq_password"
+MQTT_TOPIC_DATA = "tram_do/+"
+MQTT_TOPIC_CONTROL = "control/frequency"
+
+MONGO_URI = (
+    "mongodb+srv://khanh:khanh123@test.mongodb.net/?retryWrites=true&w=majority"
+)
+mongo_client = MongoClient(MONGO_URI)
+db = mongo_client["flood_monitoring"]
+collection_history = db["risk_history"]
+
+# ==========================================
+# 2. BỘ NHỚ LƯU TRỮ TRẠNG THÁI (EDGE RAM)
+# ==========================================
+stations_cache = {}  # Lưu trạng thái quá khứ: H_prev, R_prev, D_prev, ts_prev
+system_latest_state = []  # Mảng trạng thái mới nhất của TẤT CẢ các trạm
+output_buffer = []  # Mảng đệm để gom lô (batch) ghi vào MongoDB Atlas
+
+
+# ==========================================
+# 3. HÀM TÍNH TOÁN CƠ SỞ & XỬ LÝ MẢNG
+# ==========================================
+def calculate_h_and_v(station_name, R_current, D_current, ts_current):#Tính toán mực nước H (cm) bằng phương pháp trung bình cộng và tốc độ V (cm/phút).
+  global stations_cache
+  state = stations_cache.get(station_name,{"H_prev": 0.0, "R_prev": None, "D_prev": None, "ts_prev": None},
+  )
+
+  H_prev, R_prev, D_prev, ts_prev = (
+      state["H_prev"],
+      state["R_prev"],
+      state["D_prev"],
+      state["ts_prev"],
+  )
+
+  if ts_prev is None or R_prev is None or D_prev is None:
+    H_current = 0.0
+    V_current = 0.0
+  else:
+    delta_t = (ts_current - ts_prev)#.total_seconds() / 60.0  # phút
+    if delta_t > 0:
+      r_avg = (R_prev + R_current) / 20.0  # mm/phút
+      D_avg = (D_prev + D_current) / 2.0  # mm/phút
+      delta_H_step = ((r_avg - D_avg) * delta_t) / 10.0  # Quy đổi sang cm
+      H_current = max(0.0, H_prev + delta_H_step)
+      V_current = (H_current - H_prev) / delta_t
+    else:
+      H_current = H_prev
+      V_current = 0.0
+
+  # Cập nhật bộ nhớ đệm
+  stations_cache[station_name] = {
+      "H_prev": H_current,
+      "R_prev": R_current,
+      "D_prev": D_current,
+      "ts_prev": ts_current,
+  }
+
+  return H_current, V_current
+
+
+def update_or_append_station_result(new_record):
+  """Cập nhật mảng trạng thái tổng thể: Ghi đè nếu đã tồn tại, thêm mới nếu chưa có."""
+  global system_latest_state
+  updated = False
+  for idx, record in enumerate(system_latest_state):
+    if record["station_name"] == new_record["station_name"]:
+      system_latest_state[idx] = new_record
+      updated = True
+      break
+  if not updated:
+    system_latest_state.append(new_record)
+
+
+def calculate_and_classify_risk(H,V,R,H_tide,
+    H_crit=50.0,
+    H_warning=30.0,
+    T_response=10.0,
+    w_H=0.75,
+    w_V=0.25,
+    R_high=15.0,
+    H_tide_high=1.50,
+):
+  """Phân loại mức độ rủi ro dựa trên độ sâu H, tốc độ dâng V, mưa R và triều cường H_tide."""
+  delta_H_crit = H_crit - H_warning
+  V_crit = delta_H_crit / T_response
+
+  S_H = min(1.0, max(0.0, H / H_crit))
+  S_V = min(1.0, max(0.0, V / V_crit))
+
+  T_crit = float("inf")
+  if V > 0 and H < H_crit:
+    T_crit = (H_crit - H) / V
+
+  raw_S_risk = 100.0 * (w_H * S_H + w_V * S_V)
+
+  if T_crit <= T_response:
+    S_risk = max(raw_S_risk, 75.0)
+  elif H >= H_crit:
+    S_risk = max(raw_S_risk, 100.0 * S_H)
+  else:
+    S_risk = raw_S_risk
+
+  if S_risk < 20:
+    code, label, description = 0, "Safe", "An toàn"
+  elif 20 <= S_risk < 45:
+    code, label, description = 1, "Advisory", "Cảnh báo nhẹ"
+  elif 45 <= S_risk < 75:
+    code, label, description = 2, "Warning", "Nguy hiểm"
+  else:
+    code, label, description = 3, "Emergency", "Khẩn cấp"
+
+  if code == 0:
+    return {
+        "S_risk": round(S_risk, 2),
+        "T_crit_min": round(T_crit, 2) if T_crit != float("inf") else "N/A",
+        "code": code,
+        "label": label,
+        "description": description,
+        "status": "An toàn",
+    }
+
+  heavy_rain = R >= R_high
+  high_tide = H_tide >= H_tide_high
+
+  if heavy_rain and high_tide:
+    Status = "Ngập kết hợp Mưa lớn + Triều cường"
+  elif not heavy_rain and high_tide:
+    Status = "Ngập do Triều cường"
+  elif heavy_rain and not high_tide:
+    Status = "Ngập do Lượng mưa tăng nhanh"
+  else:
+    Status = "Ngập cục bộ do tích tụ tại bề mặt"
+
+  return {
+      "S_risk": round(S_risk, 2),
+      "T_crit_min": round(T_crit, 2) if T_crit != float("inf") else "N/A",
+      "code": code,
+      "label": label,
+      "description": description,
+      "status": Status,
+  }
+
+
+def send_signal_to_generator(client, station_name, risk_code):
+  """Gửi Signal qua MQTT để điều chỉnh tần suất gửi tin của Generator khi có cảnh báo."""
+  new_interval = 360 if risk_code == 1 else 180  # 6 phút hoặc 3 phút
+  signal_payload = json.dumps(
+      {"station_name": station_name, "interval": new_interval}
+  )
+  client.publish(MQTT_TOPIC_CONTROL, signal_payload)
+  print(
+      f" [SIGNAL] Trạm [{station_name}] Risk Code {risk_code} -> Giảm interval"
+      f" xuống {new_interval}s"
+  )
+
+
+def flush_buffer_to_mongodb():
+  """Đẩy mảng đệm chứa nhiều bản ghi lên MongoDB Atlas (Batching)."""
+  global output_buffer
+  if not output_buffer:
+    return
+
+  try:
+    collection_history.insert_many(output_buffer)
+    print(
+        f"---> Đã ghi thành công {len(output_buffer)} bản ghi lên MongoDB"
+        " Atlas.\n"
+    )
+    output_buffer.clear()
+  except Exception as e:
+    print(f" Lỗi khi xuất MongoDB Atlas: {e}")
+
+
+# ==========================================
+# 4. ĐỒNG BỘ LUỒNG XỬ LÝ DỮ LIỆU
+# ==========================================
+def process_station_data(client, station_name, R, D, H_tide, timestamp_str):
+  global output_buffer
+
+  ts_current = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
+
+  # 1. Tính toán H và V theo công thức trung bình cộng
+  H_current, V_current = calculate_h_and_v(
+      station_name, float(R), float(D), ts_current
+  )
+
+  # 2. Phân loại rủi ro
+  risk_result = calculate_and_classify_risk(
+      H=H_current, V=V_current, R=float(R), H_tide=float(H_tide)
+  )
+
+  # 3. Đóng gói bản ghi
+  final_record = {
+      "station_name": station_name,
+      "timestamp": timestamp_str,
+      "R": float(R),
+      "D": float(D),
+      "H_tide": float(H_tide),
+      "H": round(H_current, 2),
+      "V": round(V_current, 2),
+      "risk_info": risk_result,
+      "processed_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+  }
+
+  # 4. Cập nhật mảng tổng thể tức thời tại Edge Python
+  update_or_append_station_result(final_record)
+
+  # 5. Thêm vào mảng đệm và kiểm tra gom lô đẩy MongoDB Atlas
+  output_buffer.append(final_record)
+  print(
+      f" Đã tính xong [{station_name}] | H = {H_current:.2f} cm | V ="
+      f" {V_current:.2f} cm/min | Risk: {risk_result['label']}"
+  )
+
+  if len(output_buffer) >= 5:
+    flush_buffer_to_mongodb()
+
+  # 6. Phát Signal điều chỉnh tần suất gửi nếu nguy cơ ngập cao
+  if risk_result["code"] > 0:
+    send_signal_to_generator(client, station_name, risk_result["code"])
+
+
+# ==========================================
+# 5. KẾT NỐI MQTT CALLBACKS
+# ==========================================
+def on_connect(client, userdata, flags, rc):
+  if rc == 0:
+    print(" Kết nối HiveMQ Cloud thành công!")
+    client.subscribe(MQTT_TOPIC_DATA)
+  else:
+    print(f" Lỗi kết nối HiveMQ Cloud: {rc}")
+
+
+def on_message(client, userdata, msg):
+  try:
+    payload_str = msg.payload.decode("utf-8")
+    data = json.loads(payload_str)
+
+    station_name = data.get("station")
+    R = data.get("R_mm_per_min", 0.0)
+    D = data.get("D_mm_per_min", 0.0)
+    H_tide = data.get("H_tide_m", 0.0)
+    timestamp_str = data.get("time_min")
+
+    if station_name and timestamp_str:
+      process_station_data(client, station_name, R, D, H_tide, timestamp_str)
+
+  except json.JSONDecodeError:
+    print(" Lỗi giải mã JSON từ gói tin MQTT")
+  except Exception as e:
+    print(f" Lỗi hệ thống: {e}")
+
+
+# ==========================================
+# 6. KHỞI CHẠY HỆ THỐNG
+# ==========================================
+if __name__ == "__main__":
+  mqtt_client = mqtt.Client()
+  mqtt_client.username_pw_set(HIVEMQ_USER, HIVEMQ_PASSWORD)
+  mqtt_client.tls_set()
+
+  mqtt_client.on_connect = on_connect
+  mqtt_client.on_message = on_message
+
+  print("Đang khởi động Edge Python Client...")
+  mqtt_client.connect(HIVEMQ_HOST, HIVEMQ_PORT, 60)
+  mqtt_client.loop_forever()
+
+
+"""
+# ==========================================
+# 6. KHỞI CHẠY HỆ THỐNG
+# ==========================================
+if __name__ == "__main__":
+    print("=== ĐANG KHỞI CHẠY HỆ THỐNG GIÁM SÁT NGẬP LỤT (EDGE PROCESSOR) ===")
+    
+    # Khởi tạo MQTT Client 
+    # Lưu ý: Nếu dùng paho-mqtt phiên bản 2.x, cần khai báo CallbackAPIVersion
+    try:
+        # Thử nghiệm với cấu hình Paho-MQTT v2.x mới nhất
+        client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION1)
+    except AttributeError:
+        # Tương thích ngược với Paho-MQTT v1.x cũ
+        client = mqtt.Client()
+
+    # Cấu hình Xác thực tài khoản HiveMQ
+    client.username_pw_set(username=HIVEMQ_USER, password=HIVEMQ_PASSWORD)
+
+    # BẮT BUỘC: Kích hoạt bảo mật mã hóa TLS để kết nối qua cổng 8883 của HiveMQ Cloud
+    # Hàm tls_set() mặc định không truyền tham số sẽ tự động dùng chứng chỉ hệ thống
+    client.tls_set()
+
+    # Gán các hàm callback sự kiện
+    client.on_connect = on_connect
+    client.on_message = on_message
+
+    try:
+        # Tiến hành kết nối tới Cluster HiveMQ Cloud
+        print(f"Đang kết nối tới broker: {HIVEMQ_HOST}...")
+        client.connect(HIVEMQ_HOST, HIVEMQ_PORT, keepalive=60)
+        
+        # Vòng lặp giữ kết nối vĩnh viễn (Chặn luồng chính để lắng nghe liên tục)
+        # Đồng thời bắt sự kiện Ctrl+C giải phóng bộ đệm ghi đè MongoDB
+        client.loop_forever()
+        
+    except KeyboardInterrupt:
+        print("\n Nhận tín hiệu dừng chương trình (Ctrl+C)...")
+    except Exception as e:
+        print(f" Lỗi nghiêm trọng khi chạy hệ thống: {e}")
+    finally:
+        # Đảm bảo dữ liệu còn sót lại trong bộ đệm (Buffer) được ghi hết vào DB trước khi tắt
+        if output_buffer:
+            print(" Đang đẩy nốt các bản ghi còn lại trong Buffer lên MongoDB...")
+            flush_buffer_to_mongodb()
+            
+        print(" Đang ngắt kết nối MQTT & MongoDB...")
+        client.disconnect()
+        mongo_client.close()
+        print("=== HỆ THỐNG ĐÃ DỪNG AN TOÀN ===")
+
+"""
